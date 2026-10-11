@@ -182,11 +182,14 @@ def tpex_inst(d):
     return out
 
 
-def twse_shares():
-    out = {}
-    for r in fetch_json('https://openapi.twse.com.tw/v1/opendata/t187ap03_L'):
-        out[r['公司代號'].strip()] = num(r.get('已發行普通股數或TDR原股發行股數'))
-    return out
+def twse_shares(d):
+    """上市股票發行股數（取自外資持股統計表；openapi.twse.com.tw 從雲端連不到）。"""
+    j = fetch_json('https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS?date='
+                   f'{d:%Y%m%d}&selectType=ALLBUT0999&response=json')
+    if j.get('stat') != 'OK':
+        return {}
+    ix = j['fields'].index('發行股數')
+    return {r[0].strip(): num(r[ix]) for r in j['data']}
 
 
 def roc_date(s):
@@ -197,9 +200,14 @@ def roc_date(s):
 
 def disposals(today):
     """處置中的股票：{代號: '10/08～10/15'}（人工管制撮合、需預收款券）。"""
-    out = {}
-    rows = [(r.get('Code', ''), r.get('DispositionPeriod', '')) for r in
-            fetch_json('https://openapi.twse.com.tw/v1/announcement/punish')]
+    out, rows = {}, []
+    try:
+        j = fetch_json('https://www.twse.com.tw/rwd/zh/announcement/punish?response=json')
+        f = j.get('fields') or []
+        if j.get('stat') == 'OK' and '證券代號' in f and '處置起迄時間' in f:
+            rows += [(r[f.index('證券代號')], r[f.index('處置起迄時間')]) for r in j.get('data') or []]
+    except Exception as e:  # noqa: BLE001
+        fail('上市處置股', e)
     try:
         rows += [(r.get('SecuritiesCompanyCode', ''), r.get('DispositionPeriod', '')) for r in
                  fetch_json('https://www.tpex.org.tw/openapi/v1/tpex_disposal_information')]
@@ -963,7 +971,7 @@ def hot_stocks(today, tw_today, inst_today, tw_codes, disp):
         fail('產業分類', e)
     shares = {}
     try:
-        shares = twse_shares()
+        shares = twse_shares(today)
     except Exception as e:  # noqa: BLE001
         fail('上市股本', e)
     rows = []
