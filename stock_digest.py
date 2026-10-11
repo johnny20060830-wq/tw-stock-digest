@@ -238,13 +238,28 @@ GENERIC = {'電子工業', '所有證券', 'Index', '大盤', 'ETF', '上櫃ETF'
            '指數投資證券(ETN)', '存託憑證', '受益證券', '創新板股票', '創新版股票'}
 
 
+_INFO = []
+
+
+def stock_info():
+    if not _INFO:
+        _INFO.extend(finmind('TaiwanStockInfo'))
+    return _INFO
+
+
 def industries():
     out = {}
-    for x in finmind('TaiwanStockInfo'):
+    for x in stock_info():
         cat = x['industry_category'].rstrip('類')
         if cat not in GENERIC and x['stock_id'] not in out:
             out[x['stock_id']] = cat
     return out
+
+
+def names():
+    """{代號: (名稱, 上市/上櫃)}，休市日沒有當天行情時用來補名稱。"""
+    return {x['stock_id']: (x['stock_name'], {'twse': '上市', 'tpex': '上櫃'}.get(x['type'], ''))
+            for x in stock_info()}
 
 
 # ---------------------------------------------------------------- 集保股權分散（大戶／散戶）
@@ -835,6 +850,14 @@ def run(args):
                 h['chips_score_yesterday'] = chips_tw(tech(bars[:-1]) or h['tech'], inst_days[:-1], td, etf)['score']
         holdings.append(h)
         time.sleep(0.2)
+    if any('name' not in h for h in holdings):
+        try:
+            nm = names()
+            for h in holdings:
+                if 'name' not in h and h['code'] in nm:
+                    h['name'], h['market'] = nm[h['code']]
+        except Exception as e:  # noqa: BLE001
+            fail('股票名稱', e)
     out['tw_holdings'] = holdings
 
     # --- 台股新聞
