@@ -8,7 +8,7 @@
   python3 stock_digest.py --push messages.json --topic <ntfy topic>
 """
 import argparse, csv, datetime as dt, email.utils, html, http.cookiejar, io, json, os, re, statistics, sys, time
-import urllib.parse, urllib.request
+import urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 
 UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
@@ -22,21 +22,43 @@ def log(msg):
 
 
 def fail(source, e):
-    ERRORS.append(f'{source}: {type(e).__name__}: {str(e)[:160]}')
+    if '不在雲端環境允許的網域內' in str(e):
+        msg = str(e)  # 同一個被擋的網域只記一次
+    else:
+        msg = f'{source}: {type(e).__name__}: {str(e)[:160]}'
+    if msg not in ERRORS:
+        ERRORS.append(msg)
     log(f'[ERR] {source}: {e}')
 
 
+BLOCKED = set()
+
+
 def fetch(url, data=None, headers=None, timeout=45, retries=2, opener=None):
+    """網路被雲端環境擋下（proxy 403）的網站記下來，之後直接跳過，不再重試。"""
+    host = urllib.parse.urlparse(url).hostname
+    if host in BLOCKED:
+        raise RuntimeError(f'{host} 不在雲端環境允許的網域內')
     last = None
     for attempt in range(retries + 1):
         try:
             req = urllib.request.Request(url, data=data, headers={'User-Agent': UA, **(headers or {})})
             with (opener or urllib.request.build_opener()).open(req, timeout=timeout) as r:
                 return r.read()
-        except Exception as e:  # noqa: BLE001
+        except urllib.error.HTTPError as e:
+            if e.headers.get('x-deny-reason'):
+                BLOCKED.add(host)
+                raise RuntimeError(f'{host} 不在雲端環境允許的網域內') from e
+            if e.code < 500 and e.code != 429:
+                raise
             last = e
-            if attempt < retries:
-                time.sleep(2 + attempt * 4)
+        except Exception as e:  # noqa: BLE001
+            if 'Tunnel connection failed' in str(e):
+                BLOCKED.add(host)
+                raise RuntimeError(f'{host} 不在雲端環境允許的網域內') from e
+            last = e
+        if attempt < retries:
+            time.sleep(2 + attempt * 4)
     raise last
 
 
@@ -1241,3 +1263,5 @@ if __name__ == '__main__':
           f"｜台股持股 {len(result['tw_holdings'])} 檔、美股 {len(result['us_holdings'])} 檔｜熱門：{'有' if result.get('hot') else '無'}")
     print(f'報告：{a.out}/holdings.txt、{a.out}/hot.txt（原始資料 {a.out}/data.json）')
     print('抓取失敗：' + ('；'.join(ERRORS) if ERRORS else '無'))
+    if BLOCKED:
+        print('被雲端網路設定擋下的網域（要到環境設定的 Allowed domains 加入）：' + '、'.join(sorted(BLOCKED)))
