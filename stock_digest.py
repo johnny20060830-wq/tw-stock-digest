@@ -32,6 +32,8 @@ def fail(source, e):
 
 
 BLOCKED = set()
+# 證交所對雲端連線會先設 cookie 再轉址回原網址；沒有 cookie jar 的話 urllib 會轉址到放棄（HTTP 307）
+OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
 
 def fetch(url, data=None, headers=None, timeout=45, retries=2, opener=None):
@@ -43,13 +45,15 @@ def fetch(url, data=None, headers=None, timeout=45, retries=2, opener=None):
     for attempt in range(retries + 1):
         try:
             req = urllib.request.Request(url, data=data, headers={'User-Agent': UA, **(headers or {})})
-            with (opener or urllib.request.build_opener()).open(req, timeout=timeout) as r:
+            with (opener or OPENER).open(req, timeout=timeout) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
             if e.headers.get('x-deny-reason'):
                 BLOCKED.add(host)
                 raise RuntimeError(f'{host} 不在雲端環境允許的網域內') from e
-            if e.code < 500 and e.code != 429:
+            if e.code == 402 and 'finmind' in host:
+                raise RuntimeError('FinMind 免費額度這小時用完了（HTTP 402）') from e
+            if e.code < 500 and e.code not in (429, 302, 307):
                 raise
             last = e
         except Exception as e:  # noqa: BLE001
@@ -236,7 +240,10 @@ def finmind(dataset, data_id=None, start=None, end=None):
         q['start_date'] = f'{start:%Y-%m-%d}'
     if end:
         q['end_date'] = f'{end:%Y-%m-%d}'
-    j = fetch_json('https://api.finmindtrade.com/api/v4/data?' + urllib.parse.urlencode(q))
+    # 免費版不帶 token 是每個 IP 每小時 300 次（雲端 IP 可能和別人共用）；有 token 改成每個帳號 600 次
+    token = os.environ.get('FINMIND_TOKEN')
+    headers = {'Authorization': f'Bearer {token}'} if token else None
+    j = fetch_json('https://api.finmindtrade.com/api/v4/data?' + urllib.parse.urlencode(q), headers=headers)
     if j.get('status') != 200:
         raise RuntimeError(j.get('msg'))
     return j['data']
@@ -868,18 +875,11 @@ def run(args):
             fail('股票名稱', e)
     out['tw_holdings'] = holdings
 
-    # --- 台股新聞
+    # --- 台股新聞（只用 Google News，省下 FinMind 的每小時額度）
     for h in holdings:
         news = []
-        for day in (today - dt.timedelta(days=1), today):
-            try:
-                for x in finmind('TaiwanStockNews', h['code'], day):
-                    if x['date'] >= f'{today - dt.timedelta(days=1)} 06:00':
-                        news.append({'title': x['title'], 'source': x.get('source'), 'time': x['date'][5:10]})
-            except Exception as e:  # noqa: BLE001
-                fail(f'{h["code"]} FinMind新聞 {day}', e)
         try:
-            news += google_news(f'{h.get("name", "")} {h["code"]}')
+            news = google_news(f'{h.get("name", "")} {h["code"]}', max_items=15)
         except Exception as e:  # noqa: BLE001
             fail(f'{h["code"]} Google新聞', e)
         seen, uniq = set(), []
@@ -1039,7 +1039,9 @@ def hot_stocks(today, tw_today, inst_today, tw_codes, disp):
             r['trust_pct_of_shares'] = r2(r['inst_lots']['t'] * 1000 / (r['capital_100m'] * 1e7) * 100, 3)
     both = sorted([r for r in rows if r['inst_lots'] and r['inst_lots']['f'] > 0 and r['inst_lots']['t'] > 0],
                   key=lambda r: -(r['inst_lots']['f'] + r['inst_lots']['t']) * r['close'])[:10]
-    slim = lambda lst, n: [{k: v for k, v in r.items() if v not in (None, False, '')} for r in lst[:n]]
+    # 用 is 比較：漲跌幅 0.0 == False，用 in 會把它誤刪
+    slim = lambda lst, n: [{k: v for k, v in r.items() if v is not None and v is not False and v != ''}
+                           for r in lst[:n]]
     return {
         'volume_days_used': days,
         'n_up7': len(gainers), 'n_limit_up': sum(r['limit_up'] for r in gainers),
