@@ -1273,6 +1273,41 @@ def push(path, topic):
     return ok
 
 
+def push_telegram(path, chat_id):
+    """Telegram 機器人沒有 ntfy.sh 那種按 IP 計算的每日額度。聊天室由上往下讀，所以照閱讀順序送。
+    機器人 token 從環境變數 TELEGRAM_BOT_TOKEN 讀，不要寫進這個公開的程式。"""
+    token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+    if not token:
+        print('FAIL 沒有設定環境變數 TELEGRAM_BOT_TOKEN')
+        return False
+    url = f'https://api.telegram.org/bot{token}/sendMessage'
+    ok = True
+    for m in json.load(open(path, encoding='utf-8')):
+        parts = split_body(m['message'].strip())
+        for i, part in enumerate(parts):
+            title = m['title'] + (f'（{i + 1}/{len(parts)}）' if len(parts) > 1 else '')
+            payload = {'chat_id': chat_id, 'parse_mode': 'HTML', 'disable_web_page_preview': True,
+                       'text': f'<b>{html.escape(title, quote=False)}</b>\n\n{html.escape(part, quote=False)}'}
+            if m.get('click') and i == len(parts) - 1:
+                payload['reply_markup'] = {'inline_keyboard': [[{'text': '開啟', 'url': m['click']}]]}
+            data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            for attempt in range(2):
+                try:
+                    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                    print(f'{urllib.request.urlopen(req, timeout=30).status} {title}（{len(part)} 字）')
+                    break
+                except urllib.error.HTTPError as e:
+                    # 錯誤訊息只印 Telegram 的說明，不印網址（網址裡有 token）
+                    print(f'FAIL {title}: HTTP {e.code} {e.read().decode("utf-8", "replace")[:200]}')
+                except Exception as e:  # noqa: BLE001
+                    print(f'FAIL {title}: {type(e).__name__}')
+                if attempt:
+                    ok = False
+                time.sleep(3)
+            time.sleep(1.2)  # Telegram 對同一個聊天室大約每秒 1 則
+    return ok
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--tw', default='')
@@ -1281,10 +1316,11 @@ if __name__ == '__main__':
     ap.add_argument('--out', default='/tmp/stock', help='輸出資料夾')
     ap.add_argument('--skip-hot', action='store_true')
     ap.add_argument('--push', help='推播訊息 JSON 檔：[{title, message, priority, tags, click}]')
-    ap.add_argument('--topic')
+    ap.add_argument('--topic', help='ntfy 頻道')
+    ap.add_argument('--telegram-chat', help='Telegram chat_id（token 放在環境變數 TELEGRAM_BOT_TOKEN）')
     a = ap.parse_args()
     if a.push:
-        sys.exit(0 if push(a.push, a.topic) else 1)
+        sys.exit(0 if (push_telegram(a.push, a.telegram_chat) if a.telegram_chat else push(a.push, a.topic)) else 1)
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
     result = run(a)
