@@ -21,7 +21,7 @@ python3 stock_digest.py --tw 2308,2454 --us GOOGL,MU --out /tmp/stock
 - `--date 2026-10-08`：用指定日期的資料跑（測試用）
 - `--skip-hot`：不算熱門股
 - `--push messages.json --topic <ntfy topic>`：把整理好的訊息送到 [ntfy](https://ntfy.sh)，太長的訊息會自動拆開
-- `--push messages.json --telegram-chat <chat_id>`：改送到 Telegram 機器人（機器人 token 放在環境變數 `TELEGRAM_BOT_TOKEN`），照閱讀順序送出
+- `--push messages.json --telegram`：改送到 Telegram 機器人，照閱讀順序送出。機器人 token 讀環境變數 `TELEGRAM_BOT_TOKEN_2`（可用 `--telegram-token-env` 換成別的變數名），chat_id 讀 `TELEGRAM_CHAT_ID`（或用 `--telegram-chat <chat_id>` 指定）
 
 ## 評分方式
 

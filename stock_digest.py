@@ -6,6 +6,7 @@
   python3 stock_digest.py --tw 2308,2454 --us GOOGL,MU [--date 2026-10-08] [--out /tmp/stock]
     → 產生 holdings.txt（持股健檢）、hot.txt（今日熱門）、data.json（原始資料）
   python3 stock_digest.py --push messages.json --topic <ntfy topic>
+  python3 stock_digest.py --push messages.json --telegram   （token 讀 TELEGRAM_BOT_TOKEN_2，chat_id 讀 TELEGRAM_CHAT_ID）
 """
 import argparse, csv, datetime as dt, email.utils, html, http.cookiejar, io, json, os, re, statistics, sys, time
 import urllib.error, urllib.parse, urllib.request
@@ -1273,12 +1274,17 @@ def push(path, topic):
     return ok
 
 
-def push_telegram(path, chat_id):
+def push_telegram(path, chat_id, token_env='TELEGRAM_BOT_TOKEN_2'):
     """Telegram 機器人沒有 ntfy.sh 那種按 IP 計算的每日額度。聊天室由上往下讀，所以照閱讀順序送。
-    機器人 token 從環境變數 TELEGRAM_BOT_TOKEN 讀，不要寫進這個公開的程式。"""
-    token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+    股票推播用自己的機器人：token 從環境變數 TELEGRAM_BOT_TOKEN_2 讀（TELEGRAM_BOT_TOKEN 是早晨任務推播的機器人），
+    不要寫進這個公開的程式。chat_id 沒指定時讀環境變數 TELEGRAM_CHAT_ID。"""
+    token = os.environ.get(token_env, '').strip()
     if not token:
-        print('FAIL 沒有設定環境變數 TELEGRAM_BOT_TOKEN')
+        print(f'FAIL 沒有設定環境變數 {token_env}')
+        return False
+    chat_id = (chat_id or os.environ.get('TELEGRAM_CHAT_ID', '')).strip()
+    if not chat_id:
+        print('FAIL 沒有 chat_id：請用 --telegram-chat 指定，或設定環境變數 TELEGRAM_CHAT_ID')
         return False
     url = f'https://api.telegram.org/bot{token}/sendMessage'
     ok = True
@@ -1317,10 +1323,14 @@ if __name__ == '__main__':
     ap.add_argument('--skip-hot', action='store_true')
     ap.add_argument('--push', help='推播訊息 JSON 檔：[{title, message, priority, tags, click}]')
     ap.add_argument('--topic', help='ntfy 頻道')
-    ap.add_argument('--telegram-chat', help='Telegram chat_id（token 放在環境變數 TELEGRAM_BOT_TOKEN）')
+    ap.add_argument('--telegram', action='store_true', help='改送 Telegram 機器人（token 讀 --telegram-token-env 指定的環境變數）')
+    ap.add_argument('--telegram-chat', help='Telegram chat_id（不指定就讀環境變數 TELEGRAM_CHAT_ID）')
+    ap.add_argument('--telegram-token-env', default='TELEGRAM_BOT_TOKEN_2', help='放機器人 token 的環境變數名稱')
     a = ap.parse_args()
     if a.push:
-        sys.exit(0 if (push_telegram(a.push, a.telegram_chat) if a.telegram_chat else push(a.push, a.topic)) else 1)
+        if a.telegram or a.telegram_chat:
+            sys.exit(0 if push_telegram(a.push, a.telegram_chat, a.telegram_token_env) else 1)
+        sys.exit(0 if push(a.push, a.topic) else 1)
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
     result = run(a)
