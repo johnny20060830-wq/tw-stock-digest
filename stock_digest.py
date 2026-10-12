@@ -280,10 +280,10 @@ def names():
 # ---------------------------------------------------------------- 集保股權分散（大戶／散戶）
 
 def tdcc_levels_summary(levels):
-    """levels: {分級: (人數, 股數, 比例%)}。大戶＝400張以上(12–15)，千張＝15，散戶＝10張以下(1–3)。"""
+    """levels: {分級: (人數, 股數, 比例%)}。大戶＝400張以上(12–15)，散戶＝100張以下(1–9)。"""
     pct = lambda ks: r2(sum(levels.get(k, (0, 0, 0))[2] for k in ks))
     people = levels.get(17, (None,))[0] or sum(levels.get(k, (0,))[0] for k in range(1, 16))
-    return {'big400': pct(range(12, 16)), 'big1000': pct([15]), 'small10': pct([1, 2, 3]),
+    return {'big400': pct(range(12, 16)), 'small100': pct(range(1, 10)),
             'holders': people}
 
 
@@ -583,12 +583,12 @@ def chips_tw(t, inst_days, tdcc, etf):
             if abs(streak[key]) >= 3:
                 notes.append(f'{label}連{abs(streak[key])}{"買" if streak[key] > 0 else "賣"}')
     if tdcc and tdcc.get('d_big400_1w') is not None:
-        db = (tdcc['d_big400_1w'] + tdcc.get('d_big1000_1w', tdcc['d_big400_1w'])) / 2
-        ds = tdcc.get('d_small10_1w')
+        db = tdcc['d_big400_1w']
+        ds = tdcc.get('d_small100_1w')
         p = 1.5 if db >= 0.5 else 1 if db > 0 else 0.5 if db > -0.5 else 0
         if ds is not None:
             p += 1 if ds < 0 else 0.5 if ds <= 0.3 else 0
-        if tdcc.get('d_big400_4w') is not None and (tdcc['d_big400_4w'] + tdcc.get('d_big1000_4w', 0)) / 2 >= 1:
+        if (tdcc.get('d_big400_4w') or 0) >= 1:
             p += 0.5
         got += min(p, 3)
         full += 3
@@ -849,8 +849,7 @@ def run(args):
                 old = (tdcc_hist.get(code) or {}).get(key)
                 if old:
                     td[f'd_big400_{key}'] = r2(td['big400'] - old['big400'])
-                    td[f'd_big1000_{key}'] = r2(td['big1000'] - old['big1000'])
-                    td[f'd_small10_{key}'] = r2(td['small10'] - old['small10'])
+                    td[f'd_small100_{key}'] = r2(td['small100'] - old['small100'])
                     if old.get('holders') and td.get('holders'):
                         td[f'd_holders_{key}'] = int(td['holders'] - old['holders'])
             h['tdcc'] = td
@@ -1132,8 +1131,7 @@ def render_holdings(out):
         tc = h.get('tdcc')
         if tc:
             L.append(f"集保（{tc['date']}）：大戶≥400張 {tc['big400']}%（週 {sg(tc.get('d_big400_1w'), 2)}、4週 {sg(tc.get('d_big400_4w'), 2)}）"
-                     f"｜千張大戶 {tc['big1000']}%（週 {sg(tc.get('d_big1000_1w'), 2)}、4週 {sg(tc.get('d_big1000_4w'), 2)}）"
-                     f"｜散戶≤10張 {tc['small10']}%（週 {sg(tc.get('d_small10_1w'), 2)}、4週 {sg(tc.get('d_small10_4w'), 2)}）"
+                     f"｜散戶≤100張 {tc['small100']}%（週 {sg(tc.get('d_small100_1w'), 2)}、4週 {sg(tc.get('d_small100_4w'), 2)}）"
                      f"｜股東 {f0(tc.get('holders'))} 人（週 {sg(tc.get('d_holders_1w'))}）")
         e = h.get('active_etf')
         if e is not None:
