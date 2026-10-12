@@ -1242,6 +1242,9 @@ def push(path, topic):
         parts = split_body(m['message'].strip())
         for i, part in enumerate(parts):
             queue.append((m, part, m['title'] + (f'（{i + 1}/{len(parts)}）' if len(parts) > 1 else '')))
+    headers = {'Content-Type': 'application/json'}
+    if os.environ.get('NTFY_TOKEN'):  # ntfy.sh 付費方案的帳號才會按帳號、而不是按 IP 計算每日額度
+        headers['Authorization'] = 'Bearer ' + os.environ['NTFY_TOKEN']
     ok = True
     for m, part, title in reversed(queue):
         payload = {'topic': topic, 'title': title, 'message': part, 'priority': m.get('priority', 3)}
@@ -1251,14 +1254,21 @@ def push(path, topic):
         data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         for attempt in range(2):
             try:
-                req = urllib.request.Request('https://ntfy.sh/', data=data, headers={'Content-Type': 'application/json'})
+                req = urllib.request.Request('https://ntfy.sh/', data=data, headers=headers)
                 print(f'{urllib.request.urlopen(req, timeout=30).status} {title}（{len(part.encode())} bytes）')
                 break
+            except urllib.error.HTTPError as e:
+                body = e.read().decode('utf-8', 'replace')[:200]
+                if e.code == 429 and 'daily' in body:
+                    # 免費額度按 IP 計算、每天 UTC 0 點重置；雲端環境的 IP 跟別人共用，重試也沒用
+                    print(f'QUOTA 429 ntfy 今日額度已用完（雲端共用 IP），沒送出的推播：{title} 和更前面的')
+                    return False
+                print(f'FAIL {title}: HTTP {e.code} {body}')
             except Exception as e:  # noqa: BLE001
                 print(f'FAIL {title}: {e}')
-                if attempt:
-                    ok = False
-                time.sleep(3)
+            if attempt:
+                ok = False
+            time.sleep(3)
         time.sleep(1.5)
     return ok
 
