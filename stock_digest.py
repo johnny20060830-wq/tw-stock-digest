@@ -54,6 +54,8 @@ def fetch(url, data=None, headers=None, timeout=45, retries=2, opener=None):
                 raise RuntimeError(f'{host} 不在雲端環境允許的網域內') from e
             if e.code == 402 and 'finmind' in host:
                 raise RuntimeError('FinMind 免費額度這小時用完了（HTTP 402）') from e
+            if e.code == 403 and 'finmind' in host:
+                raise RuntimeError('FinMind 暫時封鎖了這個 IP（HTTP 403，約 30 分鐘後解除）') from e
             if e.code < 500 and e.code not in (429, 302, 307):
                 raise
             last = e
@@ -203,6 +205,64 @@ def roc_date(s):
     return dt.date(int(d[:-4]) + 1911, int(d[-4:-2]), int(d[-2:]))
 
 
+# ---------------------------------------------------------------- FinMind 用不了時的官方備援（較慢、只抓約半年）
+
+def official_month(code, market, first):
+    """證交所 STOCK_DAY／櫃買 tradingStock：某檔股票某個月的日成交資訊。兩邊欄位位置相同，櫃買的量是張。"""
+    if market == '上櫃':
+        j = fetch_json('https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code='
+                       f'{code}&date={first:%Y}%2F{first:%m}%2F01&response=json')
+        rows, mult = ((j.get('tables') or [{}])[0].get('data') or []), 1000
+    else:
+        j = fetch_json('https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?date='
+                       f'{first:%Y%m}01&stockNo={code}&response=json')
+        rows, mult = (j.get('data') or []) if j.get('stat') == 'OK' else [], 1
+    out = []
+    for r in rows:
+        o, hi, lo, c = (num(x) for x in r[3:7])
+        if c and hi and lo:
+            out.append({'date': str(roc_date(r[0])), 'open': o or c, 'high': hi, 'low': lo, 'close': c,
+                        'vol': (num(r[1]) or 0) * mult})
+    return out
+
+
+def official_bars(code, market, today, months=6):
+    """market 不確定（休市日）時先試上市，抓不到再試上櫃。回傳 (bars, market)。"""
+    firsts = []
+    y, m = today.year, today.month
+    for _ in range(months):
+        firsts.append(dt.date(y, m, 1))
+        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+    for mk in ([market] if market else ['上市', '上櫃']):
+        bars = []
+        for i, first in enumerate(firsts):
+            got = official_month(code, mk, first)
+            if i == 0 and not got and not market:
+                break  # 這個市場查不到這檔，換另一個市場
+            bars.extend(got)
+            time.sleep(1.5)  # 證交所對同一個 IP 太密集的請求會暫時封鎖
+        if bars:
+            return sorted({b['date']: b for b in bars}.values(), key=lambda b: b['date']), mk
+    return [], market
+
+
+_INST_DAY = {}
+
+
+def official_inst_days(code, market, dates):
+    """用證交所 T86／櫃買三大法人日報，一天一天組出這檔股票的法人歷史（同一天的資料各檔共用）。"""
+    out = []
+    for d in dates:
+        key = (d, market)
+        if key not in _INST_DAY:
+            _INST_DAY[key] = (tpex_inst if market == '上櫃' else twse_inst)(dt.date.fromisoformat(d)) or {}
+            time.sleep(1.5)
+        x = _INST_DAY[key].get(code)
+        if x:
+            out.append({'date': d, 'f': x['f'], 't': x['t'], 'd': x['d']})
+    return out
+
+
 def disposals(today):
     """處置中的股票：{代號: '10/08～10/15'}（人工管制撮合、需預收款券）。"""
     out, rows = {}, []
@@ -233,6 +293,9 @@ def disposals(today):
 
 # ---------------------------------------------------------------- FinMind（個股歷史、新聞、產業）
 
+FINMIND_DOWN = []
+FALLBACK = set()  # 改用官方備援資料的台股代號
+
 def finmind(dataset, data_id=None, start=None, end=None):
     q = {'dataset': dataset}
     if data_id:
@@ -242,9 +305,17 @@ def finmind(dataset, data_id=None, start=None, end=None):
     if end:
         q['end_date'] = f'{end:%Y-%m-%d}'
     # 免費版不帶 token 是每個 IP 每小時 300 次（雲端 IP 可能和別人共用）；有 token 改成每個帳號 600 次
+    # 第一次 402／403 之後就不再打：同一個 IP 短時間收到太多錯誤，FinMind 會封鎖它 30 分鐘
+    if FINMIND_DOWN:
+        raise RuntimeError(FINMIND_DOWN[0])
     token = os.environ.get('FINMIND_TOKEN')
     headers = {'Authorization': f'Bearer {token}'} if token else None
-    j = fetch_json('https://api.finmindtrade.com/api/v4/data?' + urllib.parse.urlencode(q), headers=headers)
+    try:
+        j = fetch_json('https://api.finmindtrade.com/api/v4/data?' + urllib.parse.urlencode(q), headers=headers)
+    except RuntimeError as e:
+        if 'FinMind' in str(e):
+            FINMIND_DOWN.append(str(e))
+        raise
     if j.get('status') != 200:
         raise RuntimeError(j.get('msg'))
     return j['data']
@@ -790,15 +861,24 @@ def run(args):
         h = {'code': code}
         if code in disp:
             h['disposal'] = disp[code]
+        bars, td = [], tw_today.get(code)
+        if td:
+            h['name'], h['market'] = td['name'], td['market']
         try:
-            rows = finmind('TaiwanStockPrice', code, today - dt.timedelta(days=420), today)
-            bars = bars_from_finmind(rows)
-            td = tw_today.get(code)
+            try:
+                bars = bars_from_finmind(finmind('TaiwanStockPrice', code, today - dt.timedelta(days=420), today))
+            except Exception as e:  # noqa: BLE001
+                if not FINMIND_DOWN:
+                    raise
+                bars, mk = official_bars(code, h.get('market'), today)
+                if not bars:
+                    raise RuntimeError(f'{e}；證交所／櫃買備援也沒抓到') from e
+                h['market'] = h.get('market') or mk
+                h['price_source'] = '證交所／櫃買備援（只有約半年資料，沒有半年線、年線和 52 週高低）'
+                FALLBACK.add(code)
             if td and td.get('close') and (not bars or bars[-1]['date'] < str(today)):
                 bars.append({'date': str(today), 'open': td['open'] or td['close'], 'high': td['high'] or td['close'],
                              'low': td['low'] or td['close'], 'close': td['close'], 'vol': td['vol']})
-            if td:
-                h['name'], h['market'] = td['name'], td['market']
             h['last_date'] = bars[-1]['date'] if bars else None
             t_now = tech(bars)
             t_prev = tech(bars[:-1]) if len(bars) > 31 else None
@@ -811,7 +891,18 @@ def run(args):
             fail(f'{code} 股價', e)
         inst_days = []
         try:
-            rows = finmind('TaiwanStockInstitutionalInvestorsBuySell', code, today - dt.timedelta(days=45), today)
+            try:
+                rows = finmind('TaiwanStockInstitutionalInvestorsBuySell', code, today - dt.timedelta(days=45), today)
+            except Exception as e:  # noqa: BLE001
+                if not FINMIND_DOWN or not bars or not h.get('market'):
+                    raise
+                # 今天的在後面用 inst_today 補上，這裡抓今天以前的 19 個交易日，湊滿 20 日
+                inst_days = official_inst_days(code, h['market'], [b['date'] for b in bars if b['date'] < str(today)][-19:])
+                if not inst_days:
+                    raise RuntimeError(f'{e}；證交所／櫃買備援也沒抓到') from e
+                h['inst_source'] = '證交所／櫃買備援'
+                FALLBACK.add(code)
+                rows = []
             byday = {}
             for x in rows:
                 dd = byday.setdefault(x['date'], {'date': x['date'], 'f': 0, 't': 0, 'd': 0})
@@ -820,7 +911,7 @@ def run(args):
                        'Dealer_self': 'd', 'Dealer_Hedging': 'd'}.get(x['name'])
                 if key:
                     dd[key] += net
-            inst_days = [byday[k] for k in sorted(byday)]
+            inst_days = inst_days or [byday[k] for k in sorted(byday)]
         except Exception as e:  # noqa: BLE001
             fail(f'{code} 法人歷史', e)
         if code in inst_today and (not inst_days or inst_days[-1]['date'] < str(today)):
@@ -938,6 +1029,9 @@ def run(args):
             fail('今日熱門', e)
 
     out['errors'] = ERRORS
+    if FINMIND_DOWN:
+        out['meta']['finmind_down'] = FINMIND_DOWN[0]
+        out['meta']['fallback'] = sorted(FALLBACK)
     return out
 
 
@@ -1096,6 +1190,8 @@ def render_holdings(out):
     L.append(f"集保週資料：{td.get('now', '—')}（比較 1週前 {td.get('1w', '—')}、4週前 {td.get('4w', '—')}）"
              f"｜主動ETF持股資料日：{m.get('active_etf_date', '—')}")
     L.append('抓取失敗：' + ('；'.join(out['errors']) if out['errors'] else '無'))
+    if m.get('finmind_down'):
+        L.append(f"備援：{m['finmind_down']}，{len(m['fallback'])} 檔台股改用證交所／櫃買資料（{'、'.join(m['fallback']) or '無'}）")
     mk = out.get('market')
     if mk and mk.get('taiex'):
         tx = mk['taiex']
@@ -1115,6 +1211,9 @@ def render_holdings(out):
         L.append(f"## {h['code']} {h.get('name', '')}（{h.get('market', '')}）收 {price(t['close'])}（{sg(t['chg_pct'], 2, '%')}）"
                  f"量 {f0(vol)}張（5日量比 {t['vol_ratio_5d']}、20日量比 {t['vol_ratio_20d']}）資料日 {h.get('last_date')}"
                  + (f"｜⚠️處置中 {h['disposal']}（人工管制撮合）" if h.get('disposal') else ''))
+        for k, label in (('price_source', '股價來源'), ('inst_source', '法人歷史來源')):
+            if h.get(k):
+                L.append(f'{label}：{h[k]}')
         L.append(f"技術基礎分 {t['score']}（昨 {h.get('tech_score_yesterday', '—')}，原始 {t['raw']}/10）｜訊號：{'、'.join(t['signals']) or '無'}")
         L += list(tech_lines(t))
         L.append('近8日K（日期 開 高 低 收 量張）：' + '；'.join(
@@ -1350,5 +1449,7 @@ if __name__ == '__main__':
           f"｜台股持股 {len(result['tw_holdings'])} 檔、美股 {len(result['us_holdings'])} 檔｜熱門：{'有' if result.get('hot') else '無'}")
     print(f'報告：{a.out}/holdings.txt、{a.out}/hot.txt（原始資料 {a.out}/data.json）')
     print('抓取失敗：' + ('；'.join(ERRORS) if ERRORS else '無'))
+    if FINMIND_DOWN:
+        print(f'備援：{FINMIND_DOWN[0]}，{len(FALLBACK)} 檔台股改用證交所／櫃買資料（不要重跑，FinMind 額度要等下一個小時）')
     if BLOCKED:
         print('被雲端網路設定擋下的網域（要到環境設定的 Allowed domains 加入）：' + '、'.join(sorted(BLOCKED)))
