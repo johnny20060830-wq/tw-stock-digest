@@ -3,8 +3,8 @@
 
 只用 Python 標準函式庫（雲端環境沒有 pandas）。
 用法：
-  python3 stock_digest.py --tw 2308,2454 --us GOOGL,MU [--date 2026-10-08] [--out /tmp/stock]
-    → 產生 holdings.txt（持股健檢）、hot.txt（今日熱門）、data.json（原始資料）
+  python3 stock_digest.py --tw 2308,2454 --us GOOGL,MU [--part tw|us] [--date 2026-10-08|prev] [--out /tmp/stock]
+    → 產生 holdings.txt（持股健檢）、hot.txt（今日熱門）、market.txt（大盤）、data.json（原始資料）
   python3 stock_digest.py --push messages.json --topic <ntfy topic>
   python3 stock_digest.py --push messages.json --telegram   （token 讀 TELEGRAM_BOT_TOKEN_2，chat_id 讀 TELEGRAM_CHAT_ID）
 """
@@ -96,8 +96,17 @@ def is_common(code):
 
 # ---------------------------------------------------------------- 台股全市場（官方）
 
+_DAY_CACHE = {}
+
+
 def twse_day(d):
-    """上市每日收盤行情。回傳 None 代表當天沒有資料（休市或尚未公布）。"""
+    """上市每日收盤行情。回傳 None 代表當天沒有資料（休市或尚未公布）。同一天只抓一次。"""
+    if ('twse', d) not in _DAY_CACHE:
+        _DAY_CACHE[('twse', d)] = _twse_day(d)
+    return _DAY_CACHE[('twse', d)]
+
+
+def _twse_day(d):
     j = fetch_json('https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date='
                    f'{d:%Y%m%d}&type=ALLBUT0999&response=json')
     if j.get('stat') != 'OK' or j.get('date') != f'{d:%Y%m%d}':
@@ -142,6 +151,12 @@ def twse_day(d):
 
 
 def tpex_day(d):
+    if ('tpex', d) not in _DAY_CACHE:
+        _DAY_CACHE[('tpex', d)] = _tpex_day(d)
+    return _DAY_CACHE[('tpex', d)]
+
+
+def _tpex_day(d):
     j = fetch_json('https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes?date='
                    f'{d:%Y}%2F{d:%m}%2F{d:%d}&id=&response=json')
     if j.get('date') != f'{d:%Y%m%d}':
@@ -759,6 +774,551 @@ def google_news(query, lang='zh-TW', max_items=6):
     return out
 
 
+# ---------------------------------------------------------------- 大盤（加權、櫃買、S&P 500、那斯達克、費半）
+#
+# 技術面（0–10，台股美股共用，依常見的大盤看法設計）：
+#   均線位置 3：站上 5 日線 0.5、月線 1、季線 1、年線（美股用 200 日線）0.5（年線離得遠，短期變化看前三條）
+#   均線方向與排列 2：月線上揚、季線上揚、5>20>60、月>季>年 各 0.5
+#   動能 2：MACD 柱 >0、DIF >0（零軸上）、日 KD K>D、12 週 RSI >50（中期多空分界）各 0.5
+#   量價 1.5：價漲量增 1.5、價漲 1、價跌量縮 0.75、價跌量增 0、其他 0.5
+#   結構 1.5：距 52 週高 <5% 0.75（<10% 0.4，≥10% 修正 0）；台股加騰落（漲跌家數比），美股加 50 日線 > 200 日線
+# 台股籌碼（0–10）：外資現貨 3、投信＋自營商 1、外資台指期淨未平倉 2.5、融資與指數背離 1.25、融資維持率 1.25、券資比 1
+#   （櫃買沒有期貨和維持率，缺的項目不計、按比例換算）
+# 美股籌碼（0–10，美股沒有公開的每日法人與融資融券）：機構出貨日 4（IBD：25 個交易日內跌 ≥0.2% 且量增的天數）、
+#   上漲日／下跌日成交量比 3、VIX 恐慌指數 3
+
+def month_firsts(today, n):
+    """今天往回 n 個月，每個月的 1 日（舊→新）。"""
+    out, y, m = [], today.year, today.month
+    for _ in range(n):
+        out.append(dt.date(y, m, 1))
+        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+    return out[::-1]
+
+
+def any_date(s):
+    """'2026/10/01'、'115/10/01' → 'YYYY-MM-DD'。"""
+    y, m, d = (int(x) for x in re.split(r'\D+', s.strip())[:3])
+    return str(dt.date(y + 1911 if y < 1911 else y, m, d))
+
+
+def taiex_bars(today, months=13):
+    """加權指數日 K（證交所 MI_5MINS_HIST），量用成交金額（FMTQIK，只抓近 3 個月）。"""
+    bars = {}
+    for first in month_firsts(today, months):
+        j = fetch_json(f'https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?date={first:%Y%m%d}&response=json')
+        for r in (j.get('data') or []) if j.get('stat') == 'OK' else []:
+            d = any_date(r[0])
+            o, hi, lo, c = (num(x) for x in r[1:5])
+            if d <= str(today) and c:
+                bars[d] = {'date': d, 'open': o or c, 'high': hi or c, 'low': lo or c, 'close': c, 'vol': 0}
+    for first in month_firsts(today, 3):
+        j = fetch_json(f'https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date={first:%Y%m%d}&response=json')
+        for r in (j.get('data') or []) if j.get('stat') == 'OK' else []:
+            d = any_date(r[0])
+            if d in bars:
+                bars[d]['vol'] = num(r[2]) or 0
+    return [bars[k] for k in sorted(bars)]
+
+
+def tpex_index_bars(today, months=13):
+    """櫃買指數日 K（櫃買 inx），量用成交金額（tradingIndex，只抓近 3 個月）。"""
+    bars = {}
+    for first in month_firsts(today, months):
+        j = fetch_json('https://www.tpex.org.tw/www/zh-tw/indexInfo/inx?date='
+                       f'{first:%Y}%2F{first:%m}%2F01&response=json')
+        for t in j.get('tables') or []:
+            for r in t.get('data') or []:
+                d = any_date(r[0])
+                o, hi, lo, c = (num(x) for x in r[1:5])
+                if d <= str(today) and c:
+                    bars[d] = {'date': d, 'open': o or c, 'high': hi or c, 'low': lo or c, 'close': c, 'vol': 0}
+    for first in month_firsts(today, 3):
+        j = fetch_json('https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingIndex?date='
+                       f'{first:%Y}%2F{first:%m}%2F01&response=json')
+        for t in j.get('tables') or []:
+            for r in t.get('data') or []:
+                d = any_date(r[0])
+                if d in bars:
+                    bars[d]['vol'] = (num(r[2]) or 0) * 1000
+    return [bars[k] for k in sorted(bars)]
+
+
+def yahoo_bars(symbol, rng='2y'):
+    """Yahoo Finance 日 K（美股指數、VIX、ETF；也當美股持股的備援）。"""
+    last = None
+    for host in ('query1', 'query2'):
+        try:
+            j = fetch_json(f'https://{host}.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}'
+                           f'?range={rng}&interval=1d')
+            break
+        except Exception as e:  # noqa: BLE001
+            last = e
+    else:
+        raise last
+    r = j['chart']['result'][0]
+    q, off = r['indicators']['quote'][0], r['meta'].get('gmtoffset', 0)
+    out = []
+    for i, ts in enumerate(r.get('timestamp') or []):
+        o, hi, lo, c, v = (q[k][i] for k in ('open', 'high', 'low', 'close', 'volume'))
+        if c and hi and lo:
+            d = str(dt.datetime.fromtimestamp(ts + off, dt.timezone.utc).date())
+            if out and out[-1]['date'] == d:
+                out.pop()
+            out.append({'date': d, 'open': o or c, 'high': hi, 'low': lo, 'close': c, 'vol': v or 0})
+    return out
+
+
+def cnbc_bars(symbol):
+    """CNBC 圖表資料（約兩年日 K）。指數代號：.SPX、.IXIC、.SOX、.VIX；.SPX 和 .SOX 沒有成交量。"""
+    j = fetch_json(f'https://ts-api.cnbc.com/harmony/app/charts/1Y.json?symbol={urllib.parse.quote(symbol)}')
+    out = []
+    for b in (j.get('barData') or {}).get('priceBars') or []:
+        o, hi, lo, c = (num(b.get(k)) for k in ('open', 'high', 'low', 'close'))
+        t = b.get('tradeTime') or ''
+        if c and hi and lo and len(t) >= 8:
+            out.append({'date': f'{t[:4]}-{t[4:6]}-{t[6:8]}', 'open': o or c, 'high': hi, 'low': lo, 'close': c,
+                        'vol': num(b.get('volume')) or 0})
+    if len(out) < 30:
+        raise RuntimeError(f'CNBC {symbol} 資料不足（{len(out)} 筆）')
+    return out
+
+
+US_SYMBOLS = {'^GSPC': '.SPX', '^IXIC': '.IXIC', '^SOX': '.SOX', '^VIX': '.VIX'}
+
+
+def us_bars(symbol):
+    """美股日 K：先用 CNBC，失敗再用 Yahoo（Yahoo 對共用 IP 常回 429）。回傳 (bars, 來源)。"""
+    try:
+        return cnbc_bars(US_SYMBOLS.get(symbol, symbol)), 'CNBC'
+    except Exception as e:  # noqa: BLE001
+        try:
+            return yahoo_bars(symbol), 'Yahoo'
+        except Exception as e2:  # noqa: BLE001
+            raise RuntimeError(f'CNBC：{str(e)[:80]}；Yahoo：{str(e2)[:80]}') from e2
+
+
+def weekly_closes(bars):
+    wk = {}
+    for b in bars:
+        y, w, _ = dt.date.fromisoformat(b['date']).isocalendar()
+        wk[(y, w)] = b['close']
+    return [wk[k] for k in sorted(wk)]
+
+
+def index_tech(bars, long_n=240, breadth=None, cross_50_200=False):
+    """大盤技術面評分（說明見本段開頭）。breadth＝(上漲家數, 下跌家數)。"""
+    t = tech(bars)
+    if not t:
+        return None
+    c = [b['close'] for b in bars]
+    close, prev = c[-1], c[-2]
+    long_name = '年線' if long_n == 240 else '200日線'
+    names = {20: '月線', 60: '季線', long_n: long_name}
+    ma = {n: sma(c, n) for n in (5, 20, 50, 60, long_n)}
+    sig, pts, full = [], 0.0, 0.0
+    # 1. 均線位置（3）
+    for n, w in ((5, 0.5), (20, 1.0), (60, 1.0), (long_n, 0.5)):
+        if not ma[n]:
+            continue
+        full += w
+        pts += w * (close > ma[n])
+        if n == 5:
+            continue
+        pma = sma(c, n, end=-1)
+        if pma and prev <= pma < close:
+            sig.append(f'站上{names[n]}')
+        elif pma and prev >= pma > close:
+            sig.append(f'跌破{names[n]}')
+    # 2. 均線方向與排列（2）
+    for n in (20, 60):
+        ago = sma(c, n, end=-5)
+        if ma[n] and ago:
+            full += 0.5
+            if ma[n] > ago:
+                pts += 0.5
+            else:
+                sig.append(f'{names[n]}下彎')
+    if ma[60]:
+        full += 0.5
+        pts += 0.5 * (ma[5] > ma[20] > ma[60])
+    if ma[60] and ma[long_n]:
+        full += 0.5
+        if ma[20] > ma[60] > ma[long_n]:
+            pts += 0.5
+            sig.append(f'月季{long_name[0]}線多頭排列' if long_n == 240 else '20/60/200日線多頭排列')
+        elif ma[20] < ma[60] < ma[long_n]:
+            sig.append('均線空頭排列')
+    # 3. 動能（2）
+    full += 2
+    pts += 0.5 * (t['macd']['osc'] > 0) + 0.5 * (t['macd']['dif'] > 0) + 0.5 * (t['kd'][0] > t['kd'][1])
+    wk = rsi_list(weekly_closes(bars), 12)
+    w_now = wk[-1] if wk else None
+    w_prev = wk[-2] if len(wk) > 1 else None
+    if w_now is not None:
+        pts += 0.5 * (w_now > 50)
+        if w_prev is not None and (w_prev >= 50) != (w_now >= 50):
+            sig.append('12週RSI' + ('站回50' if w_now >= 50 else '跌破50'))
+    # 4. 量價（1.5）
+    vr5, chg = t['vol_ratio_5d'], t['chg_pct']
+    if vr5:
+        full += 1.5
+        if chg > 0:
+            pts += 1.5 if vr5 >= 1.1 else 1.0
+        elif vr5 < 0.9:
+            pts += 0.75
+        elif vr5 >= 1.2:
+            sig.append('價跌量增')
+        else:
+            pts += 0.5
+    # 5. 結構（1.5）
+    dd = t['from_52w_high_pct']
+    full += 0.75
+    pts += 0.75 if dd > -5 else 0.4 if dd > -10 else 0
+    if dd <= -20:
+        sig.append(f'距52週高{dd:.0f}%（空頭）')
+    elif dd <= -10:
+        sig.append(f'距52週高{dd:.0f}%（修正）')
+    elif dd >= -0.5:
+        sig.append('接近52週新高')
+    if breadth and breadth[0] is not None and breadth[1]:
+        ratio = breadth[0] / breadth[1]
+        full += 0.75
+        pts += 0.75 if ratio >= 1.5 else 0.5 if ratio >= 1 else 0.25 if ratio >= 0.67 else 0
+    if cross_50_200 and ma[50] and ma[long_n]:
+        full += 0.75
+        pts += 0.75 * (ma[50] > ma[long_n])
+        p50, plong = sma(c, 50, end=-1), sma(c, long_n, end=-1)
+        if p50 and plong and p50 <= plong and ma[50] > ma[long_n]:
+            sig.append('黃金交叉（50日線穿越200日線）')
+        elif p50 and plong and p50 >= plong and ma[50] < ma[long_n]:
+            sig.append('死亡交叉（50日線跌破200日線）')
+    if t['bias20_pct'] >= 8:
+        sig.append(f"月線乖離+{t['bias20_pct']}%過熱")
+    elif t['bias20_pct'] <= -8:
+        sig.append(f"月線乖離{t['bias20_pct']}%超跌")
+    if t['rsi14'] and t['rsi14'] >= 80:
+        sig.append('日RSI過熱')
+    elif t['rsi14'] and t['rsi14'] <= 20:
+        sig.append('日RSI超賣')
+    for s in t['signals']:  # 沿用個股的 K 線訊號
+        if any(k in s for k in ('跳空', '長紅', '長黑', '影線', '連', 'MACD', 'KD')) and s not in sig:
+            sig.append(s)
+    return {'score': max(0, min(10, round(pts / full * 10))) if full else None, 'raw': r2(pts), 'full': full,
+            'signals': sig, 'wrsi12': r2(w_now, 1), 'long_n': long_n, 'ma': {str(n): r2(v) for n, v in ma.items() if v},
+            'ma_dir': {names[n]: ('上揚' if sma(c, n, end=-5) and ma[n] > sma(c, n, end=-5) else '下彎')
+                       for n in (20, 60) if ma[n]}, 't': t}
+
+
+def twse_inst_amount(d):
+    """上市三大法人買賣金額（元）。"""
+    j = fetch_json(f'https://www.twse.com.tw/rwd/zh/fund/BFI82U?type=day&dayDate={d:%Y%m%d}&response=json')
+    if j.get('stat') != 'OK' or j.get('date') != f'{d:%Y%m%d}':
+        return None
+    rows = {r[0].strip(): num(r[3]) or 0 for r in j.get('data') or []}
+    return {'f': rows.get('外資及陸資(不含外資自營商)', 0) + rows.get('外資自營商', 0), 't': rows.get('投信', 0),
+            'd': rows.get('自營商(自行買賣)', 0), 'dh': rows.get('自營商(避險)', 0)}
+
+
+def tpex_inst_amount(d):
+    """上櫃三大法人買賣金額（元）。"""
+    j = fetch_json('https://www.tpex.org.tw/www/zh-tw/insti/summary?type=Daily&date='
+                   f'{d:%Y}%2F{d:%m}%2F{d:%d}&response=json')
+    t = (j.get('tables') or [{}])[0]
+    if t.get('date') != f'{d.year - 1911}/{d:%m}/{d:%d}' or not t.get('data'):
+        return None
+    rows = {r[0].replace('　', '').strip(): num(r[3]) or 0 for r in t['data']}
+    return {'f': rows.get('外資及陸資合計', 0), 't': rows.get('投信', 0),
+            'd': rows.get('自營商(自行買賣)', 0), 'dh': rows.get('自營商(避險)', 0)}
+
+
+def twse_margin(d, prices=None):
+    """上市融資融券；有當天收盤價就順便算大盤融資維持率＝Σ(個股融資餘額×收盤價)／融資金額。"""
+    j = fetch_json(f'https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={d:%Y%m%d}&selectType=ALL&response=json')
+    if j.get('stat') != 'OK' or j.get('date') != f'{d:%Y%m%d}' or len(j.get('tables') or []) < 2:
+        return None
+    summ = {r[0]: r for r in j['tables'][0]['data']}
+    fin, short = num(summ['融資(交易單位)'][5]), num(summ['融券(交易單位)'][5])
+    amt = num(summ['融資金額(仟元)'][5]) * 1000
+    out = {'date': str(d), 'fin_lots': fin, 'short_lots': short, 'fin_amt': amt, 'short_ratio': short / fin * 100}
+    if prices:
+        mv = sum((num(r[6]) or 0) * 1000 * prices[r[0].strip()]
+                 for r in j['tables'][1]['data'] if prices.get(r[0].strip()))
+        out['maint'] = mv / amt * 100
+    return out
+
+
+def tpex_margin(d):
+    """上櫃融資融券（只有個股明細，自己加總；沒有融資金額，算不出維持率）。"""
+    j = fetch_json('https://www.tpex.org.tw/www/zh-tw/margin/balance?date='
+                   f'{d:%Y}%2F{d:%m}%2F{d:%d}&response=json')
+    t = (j.get('tables') or [{}])[0]
+    if t.get('date') != f'{d.year - 1911}/{d:%m}/{d:%d}' or not t.get('data'):
+        return None
+    fin = sum(num(r[6]) or 0 for r in t['data'])
+    short = sum(num(r[14]) or 0 for r in t['data'])
+    return {'date': str(d), 'fin_lots': fin, 'short_lots': short, 'short_ratio': short / fin * 100 if fin else None}
+
+
+def taifex_foreign_oi(start, end):
+    """期交所：外資台指期（大台）多空未平倉口數淨額 {日期: 口數}。"""
+    body = urllib.parse.urlencode({'queryStartDate': f'{start:%Y/%m/%d}', 'queryEndDate': f'{end:%Y/%m/%d}',
+                                   'commodityId': 'TXF'}).encode()
+    raw = fetch('https://www.taifex.com.tw/cht/3/futContractsDateDown', data=body,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'})
+    out = {}
+    for row in csv.reader(io.StringIO(raw.decode('cp950', 'replace'))):
+        if len(row) >= 14 and row[2].strip() == '外資及陸資' and num(row[13]) is not None:
+            out[any_date(row[0])] = int(num(row[13]))
+    return out
+
+
+def streak_of(xs):
+    n = 0
+    for x in reversed(xs):
+        s = 1 if x > 0 else -1 if x < 0 else 0
+        if s == 0 or (n and (s > 0) != (n > 0)):
+            break
+        n += s
+    return n
+
+
+def tw_index_chips(inst_days, fut=None, m_now=None, m_ago=None, idx_chg5=None):
+    """台股大盤籌碼評分（說明見本段開頭）。法人金額單位：元。"""
+    got, full, notes = 0.0, 0.0, []
+    if inst_days:
+        f = [x['f'] for x in inst_days]
+        st = streak_of(f)
+        got += 0.75 * (f[-1] > 0) + 1.0 * (sum(f[-5:]) > 0) + 0.75 * (sum(f[-10:]) > 0) + 0.5 * (st >= 3)
+        full += 3
+        got += 0.5 * (sum(x['t'] for x in inst_days[-5:]) > 0) + 0.5 * (sum(x['d'] for x in inst_days[-5:]) > 0)
+        full += 1
+        if abs(st) >= 3:
+            notes.append(f'外資連{abs(st)}{"買" if st > 0 else "賣"}')
+    if fut and len(fut) >= 6:
+        net = [fut[k] for k in sorted(fut)]
+        avg20 = sum(net[-20:]) / len(net[-20:])
+        got += (1 if net[-1] > 0 else 0.5 if net[-1] > avg20 else 0) + 0.75 * (net[-1] > net[-2]) + 0.75 * (net[-1] > net[-6])
+        full += 2.5
+        if net[-1] < avg20:
+            notes.append('外資期貨淨空單高於近20日平均')
+    if m_now and m_ago and idx_chg5 is not None and m_ago.get('fin_lots'):
+        fin5 = (m_now['fin_lots'] / m_ago['fin_lots'] - 1) * 100
+        if idx_chg5 >= 0:
+            got += 1.25 if fin5 < 0 else 1.0 if fin5 <= 2 else 0.4
+        else:
+            got += 0.6 if fin5 < 0 else 0
+            if fin5 > 0:
+                notes.append('指數跌、融資增（散戶接刀）')
+        full += 1.25
+        if m_now.get('short_ratio') is not None and m_ago.get('short_ratio') is not None:
+            up = m_now['short_ratio'] > m_ago['short_ratio']
+            got += (1 if up else 0.5) if idx_chg5 >= 0 else (0 if up else 0.5)
+            full += 1
+    if m_now and m_now.get('maint'):
+        m = m_now['maint']
+        got += 1.25 if 165 <= m <= 185 else 0.6 if (155 <= m < 165 or 185 < m <= 195) else 0
+        full += 1.25
+        if m < 140:
+            notes.append(f'融資維持率{m:.0f}%（恐慌區，常見於波段低點）')
+        elif m < 155:
+            notes.append(f'融資維持率{m:.0f}%偏低（斷頭壓力）')
+        elif m > 195:
+            notes.append(f'融資維持率{m:.0f}%偏高（過熱）')
+    return {'score': round(got / full * 10) if full else None, 'raw': r2(got), 'full': full, 'notes': notes}
+
+
+def us_index_chips(bars, vix=None):
+    """美股大盤籌碼評分（說明見本段開頭）。"""
+    got, full, notes, info = 0.0, 0.0, [], {}
+    vb = [b for b in bars if b['vol']]
+    if len(vb) >= 27:
+        dist = acc = 0
+        for a, b in zip(vb[-26:], vb[-25:]):
+            ch = (b['close'] / a['close'] - 1) * 100
+            if b['vol'] > a['vol']:
+                dist += ch <= -0.2
+                acc += ch >= 0.2
+        got += 4 if dist <= 2 else 2.5 if dist <= 4 else 1 if dist == 5 else 0
+        full += 4
+        info.update(dist_days=dist, acc_days=acc)
+        if dist >= 5:
+            notes.append(f'25日內出貨日{dist}天（機構賣壓）')
+        up = sum(b['vol'] for a, b in zip(vb[-11:], vb[-10:]) if b['close'] > a['close'])
+        dn = sum(b['vol'] for a, b in zip(vb[-11:], vb[-10:]) if b['close'] < a['close'])
+        ud = up / dn if dn else 9.99
+        got += 3 if ud >= 1.5 else 2 if ud >= 1 else 1 if ud >= 0.7 else 0
+        full += 3
+        info['updown_vol_10d'] = r2(ud)
+    if vix:
+        v = vix[-1]['close']
+        v50 = sma([b['close'] for b in vix], 50)
+        p = 3 if v < 15 else 2 if v < 20 else 1 if v < 25 else 0
+        if v50 and v > v50 * 1.2:
+            p = max(0, p - 1)
+            notes.append('VIX比50日均高兩成以上（避險升溫）')
+        got += p
+        full += 3
+        if v >= 30:
+            notes.append(f'VIX {v:.1f} 恐慌')
+        elif v < 12:
+            notes.append(f'VIX {v:.1f} 過度樂觀')
+    return {'score': round(got / full * 10) if full else None, 'raw': r2(got), 'full': full, 'notes': notes, **info}
+
+
+def breadth_of(stocks):
+    up = sum(1 for k, s in stocks.items() if is_common(k) and (s.get('chg') or 0) > 0)
+    dn = sum(1 for k, s in stocks.items() if is_common(k) and (s.get('chg') or 0) < 0)
+    return up, dn
+
+
+def index_pack(bars, it, keep=8):
+    t = it['t']
+    return {'date': bars[-1]['date'], 'close': t['close'], 'chg_pct': t['chg_pct'],
+            'chg_pts': r2(bars[-1]['close'] - bars[-2]['close']), 'vol': bars[-1]['vol'],
+            'tech': {k: v for k, v in it.items() if k != 't'}, 'ind': t,
+            'recent_bars': [[b['date'][5:], r2(b['open']), r2(b['high']), r2(b['low']), r2(b['close'])] for b in bars[-keep:]]}
+
+
+def tw_market(tw_date, tw_day, tp_day):
+    """台股大盤：加權、櫃買的技術面與籌碼面。"""
+    res = {}
+    specs = (('加權指數', taiex_bars, twse_inst_amount, tw_day),
+             ('櫃買指數', tpex_index_bars, tpex_inst_amount, tp_day))
+    fut = None
+    try:
+        fut = taifex_foreign_oi(tw_date - dt.timedelta(days=45), tw_date)
+    except Exception as e:  # noqa: BLE001
+        fail('期交所外資期貨未平倉', e)
+    for name, bar_fn, inst_fn, day in specs:
+        try:
+            bars = bar_fn(tw_date)
+        except Exception as e:  # noqa: BLE001
+            fail(f'{name} 歷史行情', e)
+            continue
+        if len(bars) < 30 or bars[-1]['date'] != str(tw_date):
+            fail(name, RuntimeError(f'指數資料到 {bars[-1]["date"] if bars else "—"}，不是 {tw_date}'))
+            continue
+        breadth = None
+        if day and name == '加權指數':
+            s = day['summary']
+            first = lambda x: num(re.match(r'[\d,]+', str(x or '')).group()) if re.match(r'[\d,]+', str(x or '')) else None
+            breadth = (first(s.get('up')), first(s.get('down')))
+        elif day:
+            breadth = breadth_of(day['stocks'])
+        it = index_tech(bars, 240, breadth)
+        if not it:
+            continue
+        pack = index_pack(bars, it)
+        pack['breadth'] = breadth
+        prev_it = index_tech(bars[:-1], 240)
+        pack['tech_score_yesterday'] = prev_it['score'] if prev_it else None
+        dates = [b['date'] for b in bars]
+        closes = {b['date']: b['close'] for b in bars}
+        inst = []
+        for d in dates[-10:]:
+            try:
+                x = inst_fn(dt.date.fromisoformat(d))
+                if x:
+                    inst.append({'date': d, **x})
+            except Exception as e:  # noqa: BLE001
+                fail(f'{name} 法人 {d}', e)
+        # 融資融券：證交所晚上才公布當天的，抓得到最新的那天為準
+        m_now = m_ago = None
+        for i in (len(dates) - 1, len(dates) - 2):
+            md = dt.date.fromisoformat(dates[i])
+            try:
+                if name == '加權指數':
+                    pday = twse_day(md)
+                    m_now = twse_margin(md, {k: v['close'] for k, v in (pday or {}).get('stocks', {}).items() if v.get('close')})
+                else:
+                    m_now = tpex_margin(md)
+            except Exception as e:  # noqa: BLE001
+                fail(f'{name} 融資融券 {md}', e)
+            if m_now:
+                j = i - 5
+                try:
+                    ad = dt.date.fromisoformat(dates[j])
+                    m_ago = twse_margin(ad) if name == '加權指數' else tpex_margin(ad)
+                except Exception as e:  # noqa: BLE001
+                    fail(f'{name} 融資融券 {dates[j]}', e)
+                break
+        idx_chg5 = None
+        if m_now and m_ago:
+            idx_chg5 = r2((closes[m_now['date']] / closes[m_ago['date']] - 1) * 100)
+        chips = tw_index_chips(inst, fut if name == '加權指數' else None, m_now, m_ago, idx_chg5)
+        yi = lambda x: r2(x / 1e8, 1)  # 元 → 億元
+        pack['inst'] = {
+            'days': [[x['date'][5:], yi(x['f']), yi(x['t']), yi(x['d'])] for x in inst[-6:]],
+            'today': {k: yi(inst[-1][k]) for k in ('f', 't', 'd', 'dh')} if inst and inst[-1]['date'] == str(tw_date) else None,
+            'sum5': {k: yi(sum(x[k] for x in inst[-5:])) for k in ('f', 't', 'd')} if inst else None,
+            'sum10': {k: yi(sum(x[k] for x in inst[-10:])) for k in ('f', 't', 'd')} if inst else None,
+            'f_streak': streak_of([x['f'] for x in inst]) if inst else None}
+        if fut and name == '加權指數':
+            ks = sorted(fut)
+            net = [fut[k] for k in ks]
+            pack['futures'] = {'date': ks[-1], 'net': net[-1], 'chg_1d': net[-1] - net[-2] if len(net) > 1 else None,
+                               'chg_5d': net[-1] - net[-6] if len(net) > 5 else None,
+                               'avg20': round(sum(net[-20:]) / len(net[-20:]))}
+        if m_now:
+            pack['margin'] = {**{k: (r2(v, 2) if isinstance(v, float) else v) for k, v in m_now.items()},
+                              'fin_amt_100m': r2(m_now['fin_amt'] / 1e8, 0) if m_now.get('fin_amt') else None,
+                              'maint': r2(m_now.get('maint'), 1),
+                              'ago_date': m_ago and m_ago['date'],
+                              'fin_chg5_pct': r2((m_now['fin_lots'] / m_ago['fin_lots'] - 1) * 100) if m_ago else None,
+                              'short_ratio_ago': r2(m_ago and m_ago.get('short_ratio'), 2),
+                              'idx_chg5_pct': idx_chg5}
+        pack['chips'] = chips
+        res[name] = pack
+    return res
+
+
+def us_market():
+    """美股大盤：S&P 500、那斯達克、費半（量用 SOXX ETF）＋ VIX。"""
+    res, vix, soxx = {}, None, {}
+    try:
+        vix, _ = us_bars('^VIX')
+        res['VIX'] = {'date': vix[-1]['date'], 'close': r2(vix[-1]['close']),
+                      'chg_pct': r2((vix[-1]['close'] / vix[-2]['close'] - 1) * 100),
+                      'ma50': r2(sma([b['close'] for b in vix], 50))}
+    except Exception as e:  # noqa: BLE001
+        fail('VIX', e)
+    # S&P 500 和費半指數沒有成交量，改用追蹤它們的 ETF（SPY、SOXX）的量
+    proxy = {}
+    for etf in ('SPY', 'SOXX'):
+        try:
+            proxy[etf] = {b['date']: b['vol'] for b in us_bars(etf)[0]}
+        except Exception as e:  # noqa: BLE001
+            fail(f'{etf}（成交量代理）', e)
+    for name, sym, vol_etf in (('S&P 500', '^GSPC', 'SPY'), ('那斯達克', '^IXIC', None), ('費城半導體', '^SOX', 'SOXX')):
+        try:
+            bars, src = us_bars(sym)
+        except Exception as e:  # noqa: BLE001
+            fail(f'{name} 行情', e)
+            continue
+        if vol_etf or not any(b['vol'] for b in bars[-30:]):
+            vol_etf = vol_etf or 'QQQ'
+            if vol_etf not in proxy:
+                try:
+                    proxy[vol_etf] = {b['date']: b['vol'] for b in us_bars(vol_etf)[0]}
+                except Exception as e:  # noqa: BLE001
+                    fail(f'{vol_etf}（成交量代理）', e)
+            for b in bars:
+                b['vol'] = (proxy.get(vol_etf) or {}).get(b['date'], 0)
+        it = index_tech(bars, 200, cross_50_200=True)
+        if not it:
+            continue
+        pack = index_pack(bars, it)
+        prev_it = index_tech(bars[:-1], 200, cross_50_200=True)
+        pack['tech_score_yesterday'] = prev_it['score'] if prev_it else None
+        pack['chips'] = us_index_chips(bars, vix)
+        pack['source'] = src
+        if vol_etf:
+            pack['vol_note'] = f'成交量用 {vol_etf} ETF'
+        res[name] = pack
+    return res
+
+
 # ---------------------------------------------------------------- 主流程
 
 def bars_from_finmind(rows, tw=True):
@@ -777,24 +1337,34 @@ def bars_from_finmind(rows, tw=True):
 
 def run(args):
     now = dt.datetime.now(TPE)
-    today = dt.date.fromisoformat(args.date) if args.date else now.date()
+    part = getattr(args, 'part', 'all')
+    if args.date == 'prev':
+        # 早上跑台股：用前一個有開盤的交易日（遇到連假會往前找）
+        today = now.date() - dt.timedelta(days=1)
+        for _ in range(12):
+            if today.weekday() < 5 and (twse_day(today) or tpex_day(today)):
+                break
+            today -= dt.timedelta(days=1)
+    else:
+        today = dt.date.fromisoformat(args.date) if args.date else now.date()
     tw_codes = list(dict.fromkeys(c.strip().upper() for c in args.tw.split(',') if c.strip()))
     us_codes = list(dict.fromkeys(c.strip().upper() for c in args.us.split(',') if c.strip()))
     out = {'meta': {'generated_at': now.strftime('%Y-%m-%d %H:%M'), 'today': str(today),
-                    'weekday': '一二三四五六日'[today.weekday()]}}
+                    'weekday': '一二三四五六日'[today.weekday()], 'part': part}}
+    if part == 'us':
+        tw_codes = []
 
     # --- 今日全市場
-    tw_today = {}
-    try:
-        tw_day = twse_day(today)
-    except Exception as e:  # noqa: BLE001
-        tw_day = None
-        fail('TWSE 今日行情', e)
-    try:
-        tp_day = tpex_day(today)
-    except Exception as e:  # noqa: BLE001
-        tp_day = None
-        fail('TPEx 今日行情', e)
+    tw_today, tw_day, tp_day = {}, None, None
+    if part != 'us':
+        try:
+            tw_day = twse_day(today)
+        except Exception as e:  # noqa: BLE001
+            fail('TWSE 今日行情', e)
+        try:
+            tp_day = tpex_day(today)
+        except Exception as e:  # noqa: BLE001
+            fail('TPEx 今日行情', e)
     out['meta']['tw_trading_day'] = bool(tw_day or tp_day)
     if tw_day:
         tw_today.update(tw_day['stocks'])
@@ -813,10 +1383,11 @@ def run(args):
                 fail(name, e)
     out['meta']['tw_inst_ready'] = bool(inst_today)
     disp = {}
-    try:
-        disp = disposals(today)
-    except Exception as e:  # noqa: BLE001
-        fail('處置股名單', e)
+    if part != 'us':
+        try:
+            disp = disposals(today)
+        except Exception as e:  # noqa: BLE001
+            fail('處置股名單', e)
     if tw_day:
         out['market'] = tw_day['summary']
         secs = sorted(tw_day['sectors'], key=lambda s: s['pct'] or 0, reverse=True)
@@ -985,11 +1556,16 @@ def run(args):
 
     # --- 美股持股
     us = []
-    for tk in us_codes:
+    for tk in (us_codes if part != 'tw' else []):
         u = {'ticker': tk}
         try:
-            rows = finmind('USStockPrice', tk, today - dt.timedelta(days=420), today - dt.timedelta(days=1))
-            bars = bars_from_finmind(rows, tw=False)
+            # 先用 CNBC／Yahoo（沒有每小時額度），都抓不到再用 FinMind
+            try:
+                bars, u['price_source'] = us_bars(tk)
+            except Exception as e:  # noqa: BLE001
+                bars = bars_from_finmind(finmind('USStockPrice', tk, today - dt.timedelta(days=420),
+                                                 today - dt.timedelta(days=1)), tw=False)
+                u['price_source'] = f'FinMind（{str(e)[:100]}）'
             u['last_date'] = bars[-1]['date'] if bars else None
             t_now = tech(bars)
             if t_now:
@@ -1021,8 +1597,14 @@ def run(args):
         us.append(u)
     out['us_holdings'] = us
 
+    # --- 大盤
+    if part != 'us' and out['meta']['tw_trading_day']:
+        out['tw_market'] = tw_market(today, tw_day, tp_day)
+    if part != 'tw':
+        out['us_market'] = us_market()
+
     # --- 今日熱門（全市場）
-    if out['meta']['tw_trading_day'] and not args.skip_hot:
+    if part != 'us' and out['meta']['tw_trading_day'] and not args.skip_hot:
         try:
             out['hot'] = hot_stocks(today, tw_today, inst_today, tw_codes, disp)
         except Exception as e:  # noqa: BLE001
@@ -1181,14 +1763,93 @@ def tech_lines(t):
     yield '轉折點：' + ' → '.join(f'{d} {k}{price(v)}' for d, k, v in t['pivots'])
 
 
+def market_lines(name, x, tw=True):
+    t, it, ch = x['ind'], x['tech'], x['chips']
+    if tw:
+        vol_txt = f"成交 {x['vol'] / 1e8:,.0f} 億" if x['vol'] else '成交 —'
+    else:
+        v = x['vol'] or 0
+        vol_txt = '量 ' + (f'{v / 1e9:.2f}B 股' if v >= 1e9 else f'{v / 1e6:.1f}M 股' if v else '—')
+    br = x.get('breadth')
+    L = ['', f"## {name}（{x['date']}）{price(x['close'])}（{sg(x['chg_pct'], 2, '%')}，{sg(x['chg_pts'], 2)}）"
+             f"｜{vol_txt}（5日量比 {t['vol_ratio_5d']}、20日量比 {t['vol_ratio_20d']}）"
+             + (f"｜上漲 {f0(br[0])}／下跌 {f0(br[1])}" if br and br[0] is not None else '')
+             + (f"｜{x['vol_note']}" if x.get('vol_note') else '')]
+    L.append(f"技術基礎分 {it['score']}（昨 {x.get('tech_score_yesterday', '—')}，原始 {it['raw']}/{it['full']}）｜訊號：{'、'.join(it['signals']) or '無'}")
+    m, ln = it['ma'], str(it['long_n'])
+    dirs = it.get('ma_dir') or {}
+    L.append(f"均線 月線(20) {price(m.get('20'))}（{dirs.get('月線', '—')}）季線(60) {price(m.get('60'))}（{dirs.get('季線', '—')}）"
+             + (f"50日 {price(m.get('50'))} " if not tw else '')
+             + f"{'年線(240)' if ln == '240' else '200日'} {price(m.get(ln))}"
+             f"｜MACD DIF {t['macd']['dif']} DEA {t['macd']['dea']} 柱 {t['macd']['osc']}｜KD {t['kd'][0]}/{t['kd'][1]}"
+             f"｜RSI14 {t['rsi14']}｜12週RSI {it['wrsi12']}｜月線乖離 {sg(t['bias20_pct'], 1, '%')}"
+             f"｜距52週高 {sg(t['from_52w_high_pct'], 1, '%')}"
+             f"｜報酬 5日 {sg(t['ret_pct']['5d'], 1, '%')} 20日 {sg(t['ret_pct']['20d'], 1, '%')} 60日 {sg(t['ret_pct']['60d'], 1, '%')}")
+    L.append('轉折點：' + ' → '.join(f'{d} {k}{price(v)}' for d, k, v in t['pivots']))
+    L.append('近8日K（日期 開 高 低 收）：' + '；'.join(' '.join(str(v) if i == 0 else price(v) for i, v in enumerate(b)) for b in x['recent_bars']))
+    L.append(f"籌碼基礎分 {ch['score']}（原始 {ch['raw']}/{ch['full']}）｜{'、'.join(ch['notes']) or '—'}")
+    if tw:
+        ins = x.get('inst') or {}
+        if ins.get('sum5'):
+            td, s5, s10 = ins.get('today'), ins['sum5'], ins['sum10']
+            L.append('法人（億元）' + (f"今日 外資 {sg(td['f'], 1)}／投信 {sg(td['t'], 1)}／自營商 {sg(td['d'], 1)}（避險 {sg(td['dh'], 1)}）"
+                                     if td else '今日未取得')
+                     + f"｜5日 外資 {sg(s5['f'], 1)}／投信 {sg(s5['t'], 1)}／自營 {sg(s5['d'], 1)}"
+                     f"｜10日 外資 {sg(s10['f'], 1)}／投信 {sg(s10['t'], 1)}／自營 {sg(s10['d'], 1)}"
+                     + (f"｜外資連{abs(ins['f_streak'])}{'買' if ins['f_streak'] > 0 else '賣'}" if abs(ins.get('f_streak') or 0) >= 2 else ''))
+            L.append('近6日 外資/投信/自營（億）：' + '；'.join(f'{d} {sg(a, 1)}/{sg(b, 1)}/{sg(c, 1)}' for d, a, b, c in ins['days']))
+        fu = x.get('futures')
+        if fu:
+            L.append(f"外資台指期淨未平倉（{fu['date'][5:]}）{f0(fu['net'])} 口（較前日 {sg(fu['chg_1d'])}、較5日前 {sg(fu['chg_5d'])}；近20日平均 {f0(fu['avg20'])}）")
+        mg = x.get('margin')
+        if mg:
+            L.append(f"融資融券（{mg['date'][5:]}，比較 {(mg.get('ago_date') or '—')[5:]}）：融資 {f0(mg['fin_lots'])} 張（5日 {sg(mg.get('fin_chg5_pct'), 2, '%')}）"
+                     + (f"、融資金額 {f0(mg.get('fin_amt_100m'))} 億" if mg.get('fin_amt_100m') else '')
+                     + f"｜指數同期 {sg(mg.get('idx_chg5_pct'), 2, '%')}"
+                     + (f"｜融資維持率 {mg['maint']}%" if mg.get('maint') else '')
+                     + f"｜融券 {f0(mg['short_lots'])} 張｜券資比 {mg.get('short_ratio')}%（比較日 {mg.get('short_ratio_ago')}%）")
+    else:
+        L.append(f"機構出貨日（25日）{ch.get('dist_days', '—')}、進貨日 {ch.get('acc_days', '—')}｜近10日 上漲日量／下跌日量 {ch.get('updown_vol_10d', '—')}")
+    return L
+
+
+def render_market(out):
+    tm, um = out.get('tw_market') or {}, out.get('us_market') or {}
+    if not tm and not um:
+        return '沒有大盤資料（休市或抓取失敗，見 holdings.txt 的「抓取失敗」）。\n'
+    L = ['# 大盤']
+    if tm:
+        L.append('（台股的融資融券是證交所晚上才公布的資料，融資那行有寫資料日）')
+        for name, x in tm.items():
+            L += market_lines(name, x, tw=True)
+    if um:
+        v = um.get('VIX')
+        if v:
+            L += ['', f"## VIX 恐慌指數（{v['date']}）{v['close']}（{sg(v['chg_pct'], 1, '%')}，50日均 {v['ma50']}）"]
+        for name in ('S&P 500', '那斯達克', '費城半導體'):
+            if name in um:
+                L += market_lines(name, um[name], tw=False)
+    L += ['', '## 評分方法',
+          '技術（0–10）：均線位置 3（5 日線 0.5、月線 1、季線 1、年線／美股 200 日線 0.5）、均線方向與排列 2、動能 2（MACD 柱>0、DIF>0、KD K>D、12週RSI>50 各 0.5）、'
+          '量價 1.5、結構 1.5（距 52 週高 <5% 0.75；台股加漲跌家數比、美股加 50 日線>200 日線）。缺的項目不計、按比例換算。',
+          '台股籌碼（0–10）：外資現貨 3（今日、5日、10日、連買）、投信＋自營商 1、外資台指期淨未平倉 2.5（淨多單、空單少於 20 日平均、比昨天／5 天前增加）、'
+          '融資與指數 1.25（指數漲融資減最好、指數跌融資增最差）、融資維持率 1.25（165–185% 健康）、券資比 1（指數漲時券資比升＝軋空燃料）。櫃買沒有期貨和維持率，按比例換算。',
+          '美股籌碼（0–10）：美股沒有公開的每日法人買賣與融資融券，改用 機構出貨日 4（IBD 定義：跌 ≥0.2% 且量比前一天大；25 日內 ≤2 天滿分、≥6 天 0 分）、'
+          '近 10 日上漲日量／下跌日量 3、VIX 3（<15 滿分、≥25 0 分，高於 50 日均兩成扣 1）。']
+    return '\n'.join(L) + '\n'
+
+
 def render_holdings(out):
     m, L = out['meta'], []
     L.append('# 基本資訊')
-    L.append(f"今天 {m['today']}（{m['weekday']}）｜台股交易日：{'是' if m['tw_trading_day'] else '否（休市）'}"
-             f"｜今日法人資料：{'已公布' if m.get('tw_inst_ready') else '未取得'}")
-    td = m.get('tdcc_dates') or {}
-    L.append(f"集保週資料：{td.get('now', '—')}（比較 1週前 {td.get('1w', '—')}、4週前 {td.get('4w', '—')}）"
-             f"｜主動ETF持股資料日：{m.get('active_etf_date', '—')}")
+    if m.get('part') == 'us':
+        L.append(f"美股推播（{m['generated_at']} 產生）：這次只抓美股，沒有台股資料")
+    else:
+        L.append(f"台股資料日 {m['today']}（{m['weekday']}）｜台股交易日：{'是' if m['tw_trading_day'] else '否（休市）'}"
+                 f"｜法人資料：{'已公布' if m.get('tw_inst_ready') else '未取得'}")
+        td = m.get('tdcc_dates') or {}
+        L.append(f"集保週資料：{td.get('now', '—')}（比較 1週前 {td.get('1w', '—')}、4週前 {td.get('4w', '—')}）"
+                 f"｜主動ETF持股資料日：{m.get('active_etf_date', '—')}")
     L.append('抓取失敗：' + ('；'.join(out['errors']) if out['errors'] else '無'))
     if m.get('finmind_down'):
         L.append(f"備援：{m['finmind_down']}，{len(m['fallback'])} 檔台股改用證交所／櫃買資料（{'、'.join(m['fallback']) or '無'}）")
@@ -1417,7 +2078,8 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--tw', default='')
     ap.add_argument('--us', default='')
-    ap.add_argument('--date', help='模擬日期 YYYY-MM-DD（測試用）')
+    ap.add_argument('--date', help='資料日 YYYY-MM-DD（測試用）；prev＝前一個台股交易日（早上跑台股用）')
+    ap.add_argument('--part', choices=('all', 'tw', 'us'), default='all', help='tw＝只做台股（含台股大盤、熱門）；us＝只做美股（含美股大盤）')
     ap.add_argument('--out', default='/tmp/stock', help='輸出資料夾')
     ap.add_argument('--skip-hot', action='store_true')
     ap.add_argument('--push', help='推播訊息 JSON 檔：[{title, message, priority, tags, click}]')
@@ -1436,7 +2098,7 @@ if __name__ == '__main__':
     result['meta']['seconds'] = round(time.time() - t0)
     with open(f'{a.out}/data.json', 'w', encoding='utf-8') as fh:
         json.dump(result, fh, ensure_ascii=False)
-    for name, fn in (('holdings.txt', render_holdings), ('hot.txt', render_hot)):
+    for name, fn in (('holdings.txt', render_holdings), ('hot.txt', render_hot), ('market.txt', render_market)):
         try:
             text = fn(result)
         except Exception as e:  # noqa: BLE001
@@ -1445,9 +2107,11 @@ if __name__ == '__main__':
         with open(f'{a.out}/{name}', 'w', encoding='utf-8') as fh:
             fh.write(text)
     m = result['meta']
-    print(f"完成，用時 {m['seconds']} 秒｜台股交易日：{m['tw_trading_day']}｜今日法人資料：{m.get('tw_inst_ready')}"
-          f"｜台股持股 {len(result['tw_holdings'])} 檔、美股 {len(result['us_holdings'])} 檔｜熱門：{'有' if result.get('hot') else '無'}")
-    print(f'報告：{a.out}/holdings.txt、{a.out}/hot.txt（原始資料 {a.out}/data.json）')
+    print(f"完成，用時 {m['seconds']} 秒｜範圍：{a.part}｜台股資料日：{m['today']}｜台股交易日：{m['tw_trading_day']}"
+          f"｜今日法人資料：{m.get('tw_inst_ready')}"
+          f"｜台股持股 {len(result['tw_holdings'])} 檔、美股 {len(result['us_holdings'])} 檔｜熱門：{'有' if result.get('hot') else '無'}"
+          f"｜大盤：台股 {len(result.get('tw_market') or {})} 個、美股 {len([k for k in (result.get('us_market') or {}) if k != 'VIX'])} 個")
+    print(f'報告：{a.out}/holdings.txt、{a.out}/hot.txt、{a.out}/market.txt（原始資料 {a.out}/data.json）')
     print('抓取失敗：' + ('；'.join(ERRORS) if ERRORS else '無'))
     if FINMIND_DOWN:
         print(f'備援：{FINMIND_DOWN[0]}，{len(FALLBACK)} 檔台股改用證交所／櫃買資料（不要重跑，FinMind 額度要等下一個小時）')
