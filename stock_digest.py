@@ -888,14 +888,23 @@ US_SYMBOLS = {'^GSPC': '.SPX', '^IXIC': '.IXIC', '^SOX': '.SOX', '^VIX': '.VIX'}
 
 
 def us_bars(symbol):
-    """美股日 K：先用 CNBC，失敗再用 Yahoo（Yahoo 對共用 IP 常回 429）。回傳 (bars, 來源)。"""
+    """美股日 K（個股、ETF、指數 ^GSPC ^IXIC ^SOX ^VIX）。回傳 (bars, 來源)。
+    順序：FinMind（雲端連得到；額度用完才換）→ CNBC（雲端主機的 IP 會被回 403）→ Yahoo（共用 IP 常回 429）。"""
+    errs = []
     try:
-        return cnbc_bars(US_SYMBOLS.get(symbol, symbol)), 'CNBC'
+        today = dt.date.today()
+        bars = bars_from_finmind(finmind('USStockPrice', symbol, today - dt.timedelta(days=760), today), tw=False)
+        if len(bars) >= 30:
+            return bars, 'FinMind'
+        errs.append(f'FinMind：只有 {len(bars)} 筆')
     except Exception as e:  # noqa: BLE001
+        errs.append(f'FinMind：{str(e)[:60]}')
+    for name, get in (('CNBC', lambda: cnbc_bars(US_SYMBOLS.get(symbol, symbol))), ('Yahoo', lambda: yahoo_bars(symbol))):
         try:
-            return yahoo_bars(symbol), 'Yahoo'
-        except Exception as e2:  # noqa: BLE001
-            raise RuntimeError(f'CNBC：{str(e)[:80]}；Yahoo：{str(e2)[:80]}') from e2
+            return get(), name
+        except Exception as e:  # noqa: BLE001
+            errs.append(f'{name}：{str(e)[:60]}')
+    raise RuntimeError('；'.join(errs))
 
 
 def weekly_closes(bars):
@@ -1274,7 +1283,7 @@ def tw_market(tw_date, tw_day, tp_day):
 
 
 def us_market():
-    """美股大盤：S&P 500、那斯達克、費半（量用 SOXX ETF）＋ VIX。"""
+    """美股大盤：S&P 500、那斯達克、費半（費半沒有成交量，用 SOXX ETF 的量）＋ VIX。"""
     res, vix, soxx = {}, None, {}
     try:
         vix, _ = us_bars('^VIX')
@@ -1283,21 +1292,17 @@ def us_market():
                       'ma50': r2(sma([b['close'] for b in vix], 50))}
     except Exception as e:  # noqa: BLE001
         fail('VIX', e)
-    # S&P 500 和費半指數沒有成交量，改用追蹤它們的 ETF（SPY、SOXX）的量
+    # 指數沒有成交量時（費半一定沒有；CNBC 的 S&P 也沒有），改用追蹤它的 ETF 的量
     proxy = {}
-    for etf in ('SPY', 'SOXX'):
-        try:
-            proxy[etf] = {b['date']: b['vol'] for b in us_bars(etf)[0]}
-        except Exception as e:  # noqa: BLE001
-            fail(f'{etf}（成交量代理）', e)
-    for name, sym, vol_etf in (('S&P 500', '^GSPC', 'SPY'), ('那斯達克', '^IXIC', None), ('費城半導體', '^SOX', 'SOXX')):
+    for name, sym, etf in (('S&P 500', '^GSPC', 'SPY'), ('那斯達克', '^IXIC', 'QQQ'), ('費城半導體', '^SOX', 'SOXX')):
         try:
             bars, src = us_bars(sym)
         except Exception as e:  # noqa: BLE001
             fail(f'{name} 行情', e)
             continue
-        if vol_etf or not any(b['vol'] for b in bars[-30:]):
-            vol_etf = vol_etf or 'QQQ'
+        vol_etf = None
+        if not any(b['vol'] for b in bars[-30:]):
+            vol_etf = etf
             if vol_etf not in proxy:
                 try:
                     proxy[vol_etf] = {b['date']: b['vol'] for b in us_bars(vol_etf)[0]}
@@ -1559,13 +1564,7 @@ def run(args):
     for tk in (us_codes if part != 'tw' else []):
         u = {'ticker': tk}
         try:
-            # 先用 CNBC／Yahoo（沒有每小時額度），都抓不到再用 FinMind
-            try:
-                bars, u['price_source'] = us_bars(tk)
-            except Exception as e:  # noqa: BLE001
-                bars = bars_from_finmind(finmind('USStockPrice', tk, today - dt.timedelta(days=420),
-                                                 today - dt.timedelta(days=1)), tw=False)
-                u['price_source'] = f'FinMind（{str(e)[:100]}）'
+            bars, u['price_source'] = us_bars(tk)
             u['last_date'] = bars[-1]['date'] if bars else None
             t_now = tech(bars)
             if t_now:
@@ -1774,7 +1773,7 @@ def market_lines(name, x, tw=True):
     L = ['', f"## {name}（{x['date']}）{price(x['close'])}（{sg(x['chg_pct'], 2, '%')}，{sg(x['chg_pts'], 2)}）"
              f"｜{vol_txt}（5日量比 {t['vol_ratio_5d']}、20日量比 {t['vol_ratio_20d']}）"
              + (f"｜上漲 {f0(br[0])}／下跌 {f0(br[1])}" if br and br[0] is not None else '')
-             + (f"｜{x['vol_note']}" if x.get('vol_note') else '')]
+             + (f"｜{x['vol_note']}" if x.get('vol_note') else '') + (f"｜資料來源 {x['source']}" if x.get('source') else '')]
     L.append(f"技術基礎分 {it['score']}（昨 {x.get('tech_score_yesterday', '—')}，原始 {it['raw']}/{it['full']}）｜訊號：{'、'.join(it['signals']) or '無'}")
     m, ln = it['ma'], str(it['long_n'])
     dirs = it.get('ma_dir') or {}

@@ -78,7 +78,7 @@ python3 stock_digest.py --tw 2308,2454 --us GOOGL,MU --out /tmp/stock
 - 臺灣證券交易所：每日收盤行情、加權指數、三大法人買賣超與金額、融資融券、公司基本資料、處置股
 - 證券櫃檯買賣中心：上櫃行情、櫃買指數、三大法人買賣明細與金額、融資融券、處置股
 - 臺灣期貨交易所：三大法人台指期未平倉
-- CNBC、Yahoo Finance：美股指數、VIX、美股持股日 K
+- FinMind（主）、CNBC、Yahoo Finance（備援）：美股指數、VIX、美股持股日 K
 - 臺灣集中保管結算所：集保戶股權分散表
 - [FinMind](https://finmindtrade.com)：個股歷史股價、法人歷史、新聞、產業分類、美股股價
 - [TANGCHIH0221/active-etf](https://github.com/TANGCHIH0221/active-etf)：台股主動式 ETF 每日持股異動
